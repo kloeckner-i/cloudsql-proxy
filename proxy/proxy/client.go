@@ -146,10 +146,11 @@ func (c *Client) handleConn(conn Conn) {
 		conn.Conn = dbgConn{conn.Conn}
 	}
 
-	c.Conns.Add(conn.Instance, conn.Conn)
-	copyThenClose(server, conn.Conn, conn.Instance, "local connection on "+conn.Conn.LocalAddr().String())
+	entry := &ConnSetEntry{conn.Conn, 0}
+	c.Conns.Add(conn.Instance, entry)
+	copyThenClose(server, conn.Conn, &entry.packetCounter, conn.Instance, "local connection on "+conn.Conn.LocalAddr().String())
 
-	if err := c.Conns.Remove(conn.Instance, conn.Conn); err != nil {
+	if err := c.Conns.Remove(conn.Instance, entry); err != nil {
 		logging.Errorf("%s", err)
 	}
 }
@@ -398,21 +399,29 @@ func (c *Client) InstanceVersion(instance string) (string, error) {
 }
 
 // Shutdown waits up to a given amount of time for all active connections to
-// close. Returns an error if there are still active connections after waiting
-// for the whole length of the timeout.
-func (c *Client) Shutdown(termTimeout time.Duration) error {
-	term, ticker := time.After(termTimeout), time.NewTicker(100*time.Millisecond)
+// be closed. Idle connections will be drained. Returns an error if there are
+// still active connections after waiting for the whole length of the timeout.
+func (c *Client) Shutdown(termTimeout, termIdleTimeout time.Duration) error {
+	term, ticker, idleTicker := time.After(termTimeout), time.NewTicker(100*time.Millisecond), time.NewTicker(termIdleTimeout)
 	defer ticker.Stop()
+	defer idleTicker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
-			if atomic.LoadUint64(&c.ConnectionsCounter) > 0 {
-				continue
+			if atomic.LoadUint64(&c.ConnectionsCounter) == 0 {
+				goto completed
+			}
+		case <-idleTicker.C:
+			if err := c.Conns.CloseIdle(); err != nil {
+				return err
 			}
 		case <-term:
+			goto completed
 		}
-		break
 	}
+
+completed:
 
 	active := atomic.LoadUint64(&c.ConnectionsCounter)
 	if active == 0 {

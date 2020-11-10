@@ -17,17 +17,111 @@
 package proxy
 
 import (
+	"context"
+	"io"
 	"net"
 	"reflect"
 	"testing"
 )
 
-var c1, c2, c3 = &dummyConn{}, &dummyConn{}, &dummyConn{}
+var (
+	c1 = &ConnSetEntry{newDummyConn(nil, nil, nil), 0}
+	c2 = &ConnSetEntry{newDummyConn(nil, nil, nil), 0}
+	c3 = &ConnSetEntry{newDummyConn(nil, nil, nil), 0}
+)
 
-type dummyConn struct{ net.Conn }
+// dummyConn is a fake network loopback connection between a io.ReadCloser and io.WriteCloser pair.
+// These pairs are typically created using a pair of io.Pipe()'s with their ends bridged into two fakeConns.
+type dummyConn struct {
+	net.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+	in     io.ReadCloser
+	out    io.WriteCloser
+	closed bool
+}
 
-func (c dummyConn) Close() error {
+func newDummyConn(parent context.Context, in io.ReadCloser, out io.WriteCloser) *dummyConn {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &dummyConn{
+		ctx:    ctx,
+		cancel: cancel,
+		in:     in,
+		out:    out,
+	}
+}
+
+func (c *dummyConn) Read(b []byte) (n int, err error) {
+	complete := make(chan bool)
+	go func() {
+		if c.in == nil {
+			n = 0
+			err = io.EOF
+		} else {
+			n, err = c.in.Read(b)
+		}
+		complete <- true
+	}()
+
+	select {
+	case <-complete:
+		return n, err
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	}
+}
+
+func (c *dummyConn) Write(b []byte) (n int, err error) {
+	complete := make(chan bool)
+	go func() {
+		if c.out == nil {
+			n = 0
+			err = io.EOF
+		} else {
+			n, err = c.out.Write(b)
+		}
+		complete <- true
+	}()
+
+	select {
+	case <-complete:
+		return n, err
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	}
+}
+
+func (c *dummyConn) Close() error {
+	c.cancel()
+	if c.in != nil {
+		if err := c.in.Close(); err != nil {
+			return err
+		}
+	}
+	if c.out != nil {
+		if err := c.out.Close(); err != nil {
+			return err
+		}
+	}
+	c.closed = true
 	return nil
+}
+
+func (c *dummyConn) LocalAddr() net.Addr {
+	return &dummyAddr{}
+}
+
+type dummyAddr struct{}
+
+func (a *dummyAddr) Network() string {
+	return "dummy"
+}
+
+func (a *dummyAddr) String() string {
+	return "fake.address"
 }
 
 func TestConnSetAdd(t *testing.T) {
@@ -93,7 +187,7 @@ func TestConns(t *testing.T) {
 	s.Add("b", c3)
 
 	got := s.Conns("b")
-	if !reflect.DeepEqual(got, []net.Conn{c3}) {
+	if !reflect.DeepEqual(got, []*ConnSetEntry{c3}) {
 		t.Fatalf("got %v, wanted only %v", got, c3)
 	}
 
@@ -111,5 +205,37 @@ func TestConns(t *testing.T) {
 	}
 	if len(looking) != 0 {
 		t.Fatalf("didn't find %v in list of Conns", looking)
+	}
+}
+
+func TestConnSetCloseIdle(t *testing.T) {
+	s := NewConnSet()
+
+	a := &ConnSetEntry{newDummyConn(nil, nil, nil), 10}
+	b := &ConnSetEntry{newDummyConn(nil, nil, nil), 20}
+
+	s.Add("c", a)
+	s.Add("c", b)
+
+	if err := s.CloseIdle(); err != nil {
+		t.Errorf("failed to close idle connections: %v", err)
+	}
+
+	a.packetCounter += 1
+
+	if err := s.CloseIdle(); err != nil {
+		t.Errorf("failed to close idle connections: %v", err)
+	}
+
+	if connA, ok := a.Conn.(*dummyConn); ok {
+		if connA.closed {
+			t.Errorf("connection a was incorrectly marked as idle")
+		}
+	}
+
+	if connB, ok := b.Conn.(*dummyConn); ok {
+		if !connB.closed {
+			t.Errorf("connection b should be marked as idle")
+		}
 	}
 }

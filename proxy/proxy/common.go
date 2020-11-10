@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
 )
@@ -29,6 +30,9 @@ import (
 // SQLScope is the Google Cloud Platform scope required for executing API
 // calls to Cloud SQL.
 const SQLScope = "https://www.googleapis.com/auth/sqlservice.admin"
+
+// ConnPacketStatus is used to track the last previous packet count.
+type ConnPacketStatus map[*ConnSetEntry]uint64
 
 type dbgConn struct {
 	net.Conn
@@ -54,11 +58,13 @@ func (d dbgConn) Close() error {
 
 // myCopy is similar to io.Copy, but reports whether the returned error was due
 // to a bad read or write. The returned error will never be nil
-func myCopy(dst io.Writer, src io.Reader) (readErr bool, err error) {
+func myCopy(dst io.Writer, src io.Reader, packetCounter *uint64) (readErr bool, err error) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
+			atomic.AddUint64(packetCounter, 1)
+
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				if err == nil {
 					return false, werr
@@ -83,11 +89,11 @@ func copyError(readDesc, writeDesc string, readErr bool, err error) {
 	logging.Errorf("%v had error: %v", desc, err)
 }
 
-func copyThenClose(remote, local io.ReadWriteCloser, remoteDesc, localDesc string) {
+func copyThenClose(remote, local io.ReadWriteCloser, packetCounter *uint64, remoteDesc, localDesc string) {
 	firstErr := make(chan error, 1)
 
 	go func() {
-		readErr, err := myCopy(remote, local)
+		readErr, err := myCopy(remote, local, packetCounter)
 		select {
 		case firstErr <- err:
 			if readErr && err == io.EOF {
@@ -101,7 +107,7 @@ func copyThenClose(remote, local io.ReadWriteCloser, remoteDesc, localDesc strin
 		}
 	}()
 
-	readErr, err := myCopy(local, remote)
+	readErr, err := myCopy(local, remote, packetCounter)
 	select {
 	case firstErr <- err:
 		if readErr && err == io.EOF {
@@ -119,14 +125,23 @@ func copyThenClose(remote, local io.ReadWriteCloser, remoteDesc, localDesc strin
 
 // NewConnSet initializes a new ConnSet and returns it.
 func NewConnSet() *ConnSet {
-	return &ConnSet{m: make(map[string][]net.Conn)}
+	return &ConnSet{m: make(map[string][]*ConnSetEntry), packetCounts: make(ConnPacketStatus)}
 }
 
-// A ConnSet tracks net.Conns associated with a provided ID.
+// ConnSetEntry is a wrapper for a net.Conn stored in a ConnSet.
+// It augments the net.Conn with an approximate packet counter.
+// Which is used to track the activity of connections.
+type ConnSetEntry struct {
+	net.Conn
+	packetCounter uint64
+}
+
+// A ConnSet tracks ConnSetEntrys associated with a provided ID.
 // A nil ConnSet will be a no-op for all methods called on it.
 type ConnSet struct {
 	sync.RWMutex
-	m map[string][]net.Conn
+	m            map[string][]*ConnSetEntry
+	packetCounts ConnPacketStatus
 }
 
 // String returns a debug string for the ConnSet.
@@ -150,7 +165,7 @@ func (c *ConnSet) String() string {
 
 // Add saves the provided conn and associates it with the given string
 // identifier.
-func (c *ConnSet) Add(id string, conn net.Conn) {
+func (c *ConnSet) Add(id string, conn *ConnSetEntry) {
 	if c == nil {
 		return
 	}
@@ -176,11 +191,11 @@ func (c *ConnSet) IDs() []string {
 }
 
 // Conns returns all active connections associated with the provided ids.
-func (c *ConnSet) Conns(ids ...string) []net.Conn {
+func (c *ConnSet) Conns(ids ...string) []*ConnSetEntry {
 	if c == nil {
 		return nil
 	}
-	var ret []net.Conn
+	var ret []*ConnSetEntry
 
 	c.RLock()
 	for _, id := range ids {
@@ -193,7 +208,7 @@ func (c *ConnSet) Conns(ids ...string) []net.Conn {
 
 // Remove undoes an Add operation to have the set forget about a conn. Do not
 // Remove an id/conn pair more than it has been Added.
-func (c *ConnSet) Remove(id string, conn net.Conn) error {
+func (c *ConnSet) Remove(id string, conn *ConnSetEntry) error {
 	if c == nil {
 		return nil
 	}
@@ -238,6 +253,38 @@ func (c *ConnSet) Close() error {
 		}
 	}
 	c.Unlock()
+
+	if errs.Len() == 0 {
+		return nil
+	}
+
+	return errors.New(errs.String())
+}
+
+// CloseIdle closes connections whose packet counts have not changed since the
+// function was last invoked. This is used to detect idle connection suitable for
+// draining.
+func (c *ConnSet) CloseIdle() error {
+	if c == nil {
+		return nil
+	}
+	var errs bytes.Buffer
+
+	c.Lock()
+	defer c.Unlock()
+
+	for id, conns := range c.m {
+		for _, conn := range conns {
+			curPacketCount := atomic.LoadUint64(&conn.packetCounter)
+			if c.packetCounts[conn] == curPacketCount {
+				if err := conn.Close(); err != nil {
+					fmt.Fprintf(&errs, "%s close error: %v\n", id, err)
+				}
+			} else {
+				c.packetCounts[conn] = curPacketCount
+			}
+		}
+	}
 
 	if errs.Len() == 0 {
 		return nil

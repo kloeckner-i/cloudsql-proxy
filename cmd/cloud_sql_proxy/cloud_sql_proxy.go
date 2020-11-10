@@ -92,6 +92,9 @@ You may set the GOOGLE_APPLICATION_CREDENTIALS environment variable for the same
 
 	// Setting to choose what API to connect to
 	host = flag.String("host", "", "When set, the proxy uses this host as the base API path. Example: https://sqladmin.googleapis.com")
+
+	// Setting to configure connection idle timeouts (for connection draining).
+	termIdleTimeout = flag.Duration("term_idle_timeout", time.Second, "The amount of time to wait before considering a connection idle.")
 )
 
 const (
@@ -546,7 +549,7 @@ func main() {
 		<-signals
 		logging.Infof("Received TERM signal. Waiting up to %s before terminating.", *termTimeout)
 
-		err := proxyClient.Shutdown(*termTimeout)
+		err := proxyClient.Shutdown(*termTimeout, *termIdleTimeout)
 		if err == nil {
 			os.Exit(0)
 		}
